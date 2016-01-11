@@ -28,18 +28,20 @@ import re
 import shutil
 import tempfile
 import unittest
-from ..client.configreader import ConfigReaderUnshared
+from ..client.configreader import ConfigReader, ConfigReaderUnshared
 from ..client import configparserinc
 from ..client.jailreader import JailReader
 from ..client.filterreader import FilterReader
 from ..client.jailsreader import JailsReader
 from ..client.actionreader import ActionReader
 from ..client.configurator import Configurator
+from ..version import version
 from .utils import LogCaptureTestCase
 
 TEST_FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
 
 from .utils import CONFIG_DIR
+CONFIG_DIR_TESTSHARE_CFG = {}
 
 STOCK = os.path.exists(os.path.join('config','fail2ban.conf'))
 
@@ -165,11 +167,11 @@ class JailReaderTest(LogCaptureTestCase):
 		self.__share_cfg = {}
 
 	def testIncorrectJail(self):
-		jail = JailReader('XXXABSENTXXX', basedir=CONFIG_DIR, share_config = self.__share_cfg)
+		jail = JailReader('XXXABSENTXXX', basedir=CONFIG_DIR, share_config=self.__share_cfg)
 		self.assertRaises(ValueError, jail.read)
 		
 	def testJailActionEmpty(self):
-		jail = JailReader('emptyaction', basedir=IMPERFECT_CONFIG, share_config = self.__share_cfg)
+		jail = JailReader('emptyaction', basedir=IMPERFECT_CONFIG, share_config=self.__share_cfg)
 		self.assertTrue(jail.read())
 		self.assertTrue(jail.getOptions())
 		self.assertTrue(jail.isEnabled())
@@ -177,7 +179,7 @@ class JailReaderTest(LogCaptureTestCase):
 		self.assertLogged('No actions were defined for emptyaction')
 
 	def testJailActionFilterMissing(self):
-		jail = JailReader('missingbitsjail', basedir=IMPERFECT_CONFIG, share_config = self.__share_cfg)
+		jail = JailReader('missingbitsjail', basedir=IMPERFECT_CONFIG, share_config=self.__share_cfg)
 		self.assertTrue(jail.read())
 		self.assertFalse(jail.getOptions())
 		self.assertTrue(jail.isEnabled())
@@ -200,7 +202,7 @@ class JailReaderTest(LogCaptureTestCase):
 
 	if STOCK:
 		def testStockSSHJail(self):
-			jail = JailReader('sshd', basedir=CONFIG_DIR, share_config = self.__share_cfg) # we are running tests from root project dir atm
+			jail = JailReader('sshd', basedir=CONFIG_DIR, share_config=self.__share_cfg) # we are running tests from root project dir atm
 			self.assertTrue(jail.read())
 			self.assertTrue(jail.getOptions())
 			self.assertFalse(jail.isEnabled())
@@ -251,6 +253,34 @@ class JailReaderTest(LogCaptureTestCase):
 		result = JailReader.extractOptions(option)
 		self.assertEqual(expected, result)
 
+	def testVersionAgent(self):
+		jail = JailReader('blocklisttest', force_enable=True, basedir=CONFIG_DIR)
+		# emulate jail.read(), because such jail not exists:
+		ConfigReader.read(jail, "jail"); 
+		sections = jail._cfg.get_sections()
+		sections['blocklisttest'] = dict((('__name__', 'blocklisttest'), 
+			('filter', ''),	('failregex', '^test <HOST>$'),
+			('sender', 'f2b-test@example.com'), ('blocklist_de_apikey', 'test-key'), 
+			('action', 
+				'%(action_blocklist_de)s\n'
+				'%(action_badips_report)s\n'
+				'%(action_badips)s\n'
+				'mynetwatchman[port=1234,protocol=udp,agent="%(fail2ban_agent)s"]'
+			),
+		))
+		# get options:
+		self.assertTrue(jail.getOptions())
+		# convert and get stream
+		stream = jail.convert()
+		# get action and retrieve agent from it, compare with agent saved in version:
+		act = [o for o in stream if len(o) > 4 and (o[4] == 'agent' or o[4].endswith('badips.py'))]
+		useragent = 'Fail2Ban/%s' % version
+		self.assertEqual(len(act), 4)
+		self.assertEqual(act[0], ['set', 'blocklisttest', 'action', 'blocklist_de', 'agent', useragent])
+		self.assertEqual(act[1], ['set', 'blocklisttest', 'action', 'badips', 'agent', useragent])
+		self.assertEqual(eval(act[2][5]).get('agent', '<wrong>'), useragent)
+		self.assertEqual(act[3], ['set', 'blocklisttest', 'action', 'mynetwatchman', 'agent', useragent])
+
 	def testGlob(self):
 		d = tempfile.mkdtemp(prefix="f2b-temp")
 		# Generate few files
@@ -273,6 +303,10 @@ class JailReaderTest(LogCaptureTestCase):
 
 		
 class FilterReaderTest(unittest.TestCase):
+
+	def __init__(self, *args, **kwargs):
+		super(FilterReaderTest, self).__init__(*args, **kwargs)
+		self.__share_cfg = {}
 
 	def testConvert(self):
 		output = [['set', 'testcase01', 'addfailregex',
@@ -311,9 +345,8 @@ class FilterReaderTest(unittest.TestCase):
 		# is unreliable
 		self.assertEqual(sorted(filterReader.convert()), sorted(output))
 
-		filterReader = FilterReader(
-			"testcase01", "testcase01", {'maxlines': "5"})
-		filterReader.setBaseDir(TEST_FILES_DIR)
+		filterReader = FilterReader("testcase01", "testcase01", {'maxlines': "5"},
+		  share_config=self.__share_cfg, basedir=TEST_FILES_DIR)
 		filterReader.read()
 		#filterReader.getOptions(["failregex", "ignoreregex"])
 		filterReader.getOptions(None)
@@ -322,8 +355,8 @@ class FilterReaderTest(unittest.TestCase):
 
 	def testFilterReaderSubstitionDefault(self):
 		output = [['set', 'jailname', 'addfailregex', 'to=sweet@example.com fromip=<IP>']]
-		filterReader = FilterReader('substition', "jailname", {})
-		filterReader.setBaseDir(TEST_FILES_DIR)
+		filterReader = FilterReader('substition', "jailname", {},
+		  share_config=self.__share_cfg, basedir=TEST_FILES_DIR)
 		filterReader.read()
 		filterReader.getOptions(None)
 		c = filterReader.convert()
@@ -331,16 +364,34 @@ class FilterReaderTest(unittest.TestCase):
 
 	def testFilterReaderSubstitionSet(self):
 		output = [['set', 'jailname', 'addfailregex', 'to=sour@example.com fromip=<IP>']]
-		filterReader = FilterReader('substition', "jailname", {'honeypot': 'sour@example.com'})
-		filterReader.setBaseDir(TEST_FILES_DIR)
+		filterReader = FilterReader('substition', "jailname", {'honeypot': 'sour@example.com'},
+		  share_config=self.__share_cfg, basedir=TEST_FILES_DIR)
+		filterReader.read()
+		filterReader.getOptions(None)
+		c = filterReader.convert()
+		self.assertEqual(sorted(c), sorted(output))
+
+	def testFilterReaderSubstitionKnown(self):
+		output = [['set', 'jailname', 'addfailregex', 'to=test,sweet@example.com,test2,sweet@example.com fromip=<IP>']]
+		filterName, filterOpt = JailReader.extractOptions(
+			'substition[honeypot="<sweet>,<known/honeypot>", sweet="test,<known/honeypot>,test2"]')
+		filterReader = FilterReader('substition', "jailname", filterOpt,
+		  share_config=self.__share_cfg, basedir=TEST_FILES_DIR)
 		filterReader.read()
 		filterReader.getOptions(None)
 		c = filterReader.convert()
 		self.assertEqual(sorted(c), sorted(output))
 
 	def testFilterReaderSubstitionFail(self):
-		filterReader = FilterReader('substition', "jailname", {'honeypot': '<sweet>', 'sweet': '<honeypot>'})
-		filterReader.setBaseDir(TEST_FILES_DIR)
+		# directly subst the same var :
+		filterReader = FilterReader('substition', "jailname", {'honeypot': '<honeypot>'},
+		  share_config=self.__share_cfg, basedir=TEST_FILES_DIR)
+		filterReader.read()
+		filterReader.getOptions(None)
+		self.assertRaises(ValueError, FilterReader.convert, filterReader)
+		# cross subst the same var :
+		filterReader = FilterReader('substition', "jailname", {'honeypot': '<sweet>', 'sweet': '<honeypot>'},
+		  share_config=self.__share_cfg, basedir=TEST_FILES_DIR)
 		filterReader.read()
 		filterReader.getOptions(None)
 		self.assertRaises(ValueError, FilterReader.convert, filterReader)
@@ -508,12 +559,13 @@ class JailsReaderTest(LogCaptureTestCase):
 				if jail == 'INCLUDES':
 					continue
 				filterName = jails.get(jail, 'filter')
+				filterName, filterOpt = JailReader.extractOptions(filterName)
 				allFilters.add(filterName)
 				self.assertTrue(len(filterName))
 				# moreover we must have a file for it
 				# and it must be readable as a Filter
-				filterReader = FilterReader(filterName, jail, {})
-				filterReader.setBaseDir(CONFIG_DIR)
+				filterReader = FilterReader(filterName, jail, filterOpt, 
+					share_config=self.__share_cfg, basedir=CONFIG_DIR)
 				self.assertTrue(filterReader.read(),"Failed to read filter:" + filterName)		  # opens fine
 				filterReader.getOptions({})	  # reads fine
 
@@ -551,7 +603,10 @@ class JailsReaderTest(LogCaptureTestCase):
 			filters = set(os.path.splitext(os.path.split(a)[1])[0]
 				for a in glob.glob(os.path.join('config', 'filter.d', '*.conf'))
 					if not a.endswith('common.conf'))
-			filters_jail = set(jail.options['filter'] for jail in jails.jails)
+			# get filters of all jails (filter names without options inside filter[...])
+			filters_jail = set(
+				JailReader.extractOptions(jail.options['filter'])[0] for jail in jails.jails
+			)
 			self.maxDiff = None
 			self.assertTrue(filters.issubset(filters_jail),
 					"More filters exists than are referenced in stock jail.conf %r" % filters.difference(filters_jail))
@@ -568,6 +623,12 @@ class JailsReaderTest(LogCaptureTestCase):
 
 			# by default we have lots of jails ;)
 			self.assertTrue(len(comm_commands))
+
+			# some common sanity checks for commands
+			for command in comm_commands:
+				if len(command) >= 3 and [command[0], command[2]] == ['set', 'bantime']:
+					self.assertTrue(isinstance(command[3], int))
+					self.assertTrue(command[3] > 0)
 
 			# and we know even some of them by heart
 			for j in ['sshd', 'recidive']:
